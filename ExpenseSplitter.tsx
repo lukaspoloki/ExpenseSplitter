@@ -25,7 +25,7 @@ import ViewShot from "react-native-view-shot";
 import * as Sharing from 'expo-sharing';
 import * as FileSystem from 'expo-file-system';
 
-const { width } = Dimensions.get('window');
+const { width, height } = Dimensions.get('window');
 
 interface ExpenseSplitterProps {
   route: RouteProps;
@@ -42,6 +42,10 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [currency, setCurrency] = useState<string>('USD');
+  const [fadeAnim] = useState(new Animated.Value(0));
+  const [slideAnim] = useState(new Animated.Value(30));
+  const [formFocused, setFormFocused] = useState<boolean>(false);
+  
   const currencySymbols: {[key: string]: string} = {
     USD: '$',
     EUR: '€',
@@ -114,6 +118,21 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
     } else {
       setIsLoading(false);
     }
+    
+    // Animate in the content
+    Animated.parallel([
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 800,
+        useNativeDriver: true,
+      }),
+      Animated.spring(slideAnim, {
+        toValue: 0,
+        tension: 50,
+        friction: 8,
+        useNativeDriver: true,
+      }),
+    ]).start();
   }, [splitId]);
 
   // Save split data when people, settlements, or splitName changes
@@ -199,203 +218,135 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
     
     const updatedPeople = [...people, newPerson];
     setPeople(updatedPeople);
+    calculateSettlements(updatedPeople);
     
-    // Clear inputs after adding a person
+    // Reset form
     setNewName('');
     setNewAmount('');
-    
-    // Focus back on the name input for quick entry of next person
     nameInputRef.current?.focus();
-    
-    // Recalculate settlements when a person is added
-    if (updatedPeople.length >= 2) {
-      calculateSettlements(updatedPeople);
-    }
   };
 
   const removePerson = (index: number) => {
-    const updatedPeople = people.filter((_, i) => i !== index);
-    setPeople(updatedPeople);
-    
-    // Recalculate settlements or clear them if fewer than 2 people
-    if (updatedPeople.length >= 2) {
-      calculateSettlements(updatedPeople);
-    } else {
-      setSettlements([]);
-    }
+    Alert.alert(
+      "Remove Person", 
+      "Are you sure you want to remove this person?",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Remove", style: "destructive", onPress: () => {
+          const updatedPeople = people.filter((_, i) => i !== index);
+          setPeople(updatedPeople);
+          calculateSettlements(updatedPeople);
+        }}
+      ]
+    );
   };
 
   const calculateSettlements = (peopleList = people) => {
     if (peopleList.length < 2) {
-      Alert.alert("Error", "You need at least 2 people to calculate settlements");
-      return [];
+      setSettlements([]);
+      return;
     }
 
     const totalAmount = peopleList.reduce((sum, person) => sum + person.amount, 0);
     const averageAmount = totalAmount / peopleList.length;
-    
-    // Create two arrays: one for people who paid more (creditors)
-    // and one for people who paid less (debtors)
-    const creditors: {name: string, amount: number}[] = [];
-    const debtors: {name: string, amount: number}[] = [];
-    
-    peopleList.forEach(person => {
-      const diff = person.amount - averageAmount;
-      if (diff > 0.01) { // Using small threshold to avoid floating point issues
-        creditors.push({name: person.name, amount: diff});
-      } else if (diff < -0.01) {
-        debtors.push({name: person.name, amount: -diff}); // Convert to positive
+
+    // Calculate who owes what
+    const balances = peopleList.map(person => ({
+      name: person.name,
+      balance: person.amount - averageAmount
+    }));
+
+    const settlements: Settlement[] = [];
+    const debtors = balances.filter(b => b.balance < 0).map(b => ({ ...b, balance: -b.balance }));
+    const creditors = balances.filter(b => b.balance > 0);
+
+    // Simple settlement algorithm
+    let i = 0, j = 0;
+    while (i < debtors.length && j < creditors.length) {
+      const debt = debtors[i].balance;
+      const credit = creditors[j].balance;
+      const settlement = Math.min(debt, credit);
+
+      if (settlement > 0.01) { // Avoid tiny settlements
+        settlements.push({
+          from: debtors[i].name,
+          to: creditors[j].name,
+          amount: settlement
+        });
       }
-    });
-    
-    // Sort both arrays by amount (descending)
-    creditors.sort((a, b) => b.amount - a.amount);
-    debtors.sort((a, b) => b.amount - a.amount);
-    
-    const newSettlements: Settlement[] = [];
-    
-    // For each debtor, find creditors to pay
-    debtors.forEach(debtor => {
-      let remainingDebt = debtor.amount;
-      
-      while (remainingDebt > 0.01 && creditors.length > 0) { // Using 0.01 to avoid floating point issues
-        const creditor = creditors[0];
-        const paymentAmount = Math.min(remainingDebt, creditor.amount);
-        
-        if (paymentAmount > 0) {
-          newSettlements.push({
-            from: debtor.name,
-            to: creditor.name,
-            amount: Math.round(paymentAmount * 100) / 100 // Round to 2 decimal places
-          });
-        }
-        
-        remainingDebt -= paymentAmount;
-        creditor.amount -= paymentAmount;
-        
-        // If creditor is fully paid, remove them from the list
-        if (creditor.amount < 0.01) {
-          creditors.shift();
-        }
-      }
-    });
-    
-    setSettlements(newSettlements);
-    return newSettlements;
-  };
-  
-  const handleAmountChange = (text: string) => {
-    const numericValue = parseFloat(text);
-    if (!isNaN(numericValue) || text === '' || text === '.') {
-      setNewAmount(text);
+
+      debtors[i].balance -= settlement;
+      creditors[j].balance -= settlement;
+
+      if (debtors[i].balance < 0.01) i++;
+      if (creditors[j].balance < 0.01) j++;
     }
+
+    setSettlements(settlements);
   };
 
-  const renderSettlement = ({ item }: { item: Settlement }) => (
-    <View style={styles.settlementItem}>
-      <Text style={styles.settlementText}>
-        {item.from} owes {item.to} {item.amount}
-      </Text>
-    </View>
-  );
+  const handleAmountChange = (text: string) => {
+    // Allow only numbers and one decimal point
+    const filtered = text.replace(/[^0-9.]/g, '');
+    const parts = filtered.split('.');
+    if (parts.length > 2) return;
+    setNewAmount(filtered);
+  };
 
-  // Add a function to handle split name changes
   const handleSplitNameChange = (text: string) => {
     setSplitName(text);
-    // No need for debounce as the useEffect will save when splitName changes
   };
 
-  // Update the handleCurrencyChange function to save data immediately and reliably
   const handleCurrencyChange = async (selectedCurrency: string) => {
-    // First update the state
     setCurrency(selectedCurrency);
     
-    // Then manually save the data with the new currency
-    try {
-      if (!splitId) return;
-      
-      const savedSplits = await AsyncStorage.getItem('splits');
-      let splits: Split[] = savedSplits ? JSON.parse(savedSplits) : [];
-      
-      const splitIndex = splits.findIndex(split => split.id === splitId);
-      
-      if (splitIndex !== -1) {
-        splits[splitIndex] = {
-          ...splits[splitIndex],
-          name: splitName.trim() || 'Untitled Split',
-          people: people,
-          settlements: settlements,
-          currency: selectedCurrency // Use the new currency directly
-        };
-        
-        await AsyncStorage.setItem('splits', JSON.stringify(splits));
-        console.log('Currency updated and saved:', selectedCurrency);
-      }
-    } catch (error) {
-      console.error('Failed to save currency change:', error);
-      Alert.alert('Error', 'Failed to save currency change');
-    }
+    // Show confirmation
+    Alert.alert(
+      "Currency Changed", 
+      `Currency changed to ${selectedCurrency}`,
+      [{ text: "OK" }]
+    );
   };
 
-  // Add the currency symbol getter
   const getCurrencySymbol = () => {
-    return currencySymbols[currency] || '$';
+    return currencySymbols[currency] || currency;
   };
 
-  // Add this function to format currency display with proper spacing
   const formatCurrency = (amount: number) => {
-    const symbol = currencySymbols[currency] || currency;
-    
-    // For currency codes (not symbols), add a space between code and amount
-    const needsSpace = symbol.length > 1;
-    
-    return needsSpace 
-      ? `${symbol} ${amount.toFixed(2)}`
-      : `${symbol}${amount.toFixed(2)}`;
+    const symbol = getCurrencySymbol();
+    return `${symbol}${amount.toFixed(2)}`;
   };
 
-  // Add this function to handle sharing
   const shareSettlementImage = async () => {
-    if (!viewShotRef.current || people.length < 2) return;
-    
     try {
-      const uri = await viewShotRef.current?.capture?.() || '';
-    
-      if (!uri) {
-        Alert.alert('Error', 'Failed to capture image');
-        return;
-      }
+      if (!viewShotRef.current?.capture) return;
       
-      // Check if sharing is available
-      const isAvailable = await Sharing.isAvailableAsync();
-      if (!isAvailable) {
-        Alert.alert('Error', 'Sharing is not available on this device');
-        return;
-      }
-      
-      // Save the image to a temporary file if needed
-      const tempUri = FileSystem.cacheDirectory + `${splitName}-summary.png`;
-      await FileSystem.copyAsync({
+      const uri = await viewShotRef.current.capture();
+      const fileUri = FileSystem.documentDirectory + 'settlement.png';
+      await FileSystem.moveAsync({
         from: uri,
-        to: tempUri
+        to: fileUri,
       });
       
-      // Share the image
-      await Sharing.shareAsync(tempUri, {
-        mimeType: 'image/png',
-        dialogTitle: `${splitName} - Split Summary`,
-      });
+      await Sharing.shareAsync(fileUri);
     } catch (error) {
-      console.error('Error sharing image:', error);
-      Alert.alert('Error', 'Failed to share the split summary');
+      console.error('Failed to share image:', error);
+      Alert.alert('Error', 'Failed to share settlement image');
     }
   };
 
-  // Update the SplitSummaryCard component to include payment overview
+  const getTotalAmount = () => {
+    return people.reduce((sum, person) => sum + person.amount, 0);
+  };
+
+  const getAverageAmount = () => {
+    return people.length > 0 ? getTotalAmount() / people.length : 0;
+  };
+
   const SplitSummaryCard = () => (
-    <View style={styles.summaryCardForSharing}>
+    <ViewShot ref={viewShotRef} style={styles.summaryCardForSharing}>
       <LinearGradient
-        colors={['#6366f1', '#8b5cf6']}
+        colors={['#667eea', '#764ba2']}
         start={[0, 0]}
         end={[1, 0]}
         style={styles.summaryCardHeader}
@@ -408,14 +359,14 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
         <View style={styles.summaryCardSection}>
           <Text style={styles.summaryCardSectionTitle}>Total Amount</Text>
           <Text style={styles.summaryCardAmount}>
-            {formatCurrency(people.reduce((sum, person) => sum + person.amount, 0))}
+            {formatCurrency(getTotalAmount())}
           </Text>
         </View>
         
         <View style={styles.summaryCardSection}>
           <Text style={styles.summaryCardSectionTitle}>Fair Share Per Person</Text>
           <Text style={styles.summaryCardAmount}>
-            {formatCurrency(people.reduce((sum, person) => sum + person.amount, 0) / people.length)}
+            {formatCurrency(getAverageAmount())}
           </Text>
         </View>
         
@@ -452,7 +403,7 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
           </View>
         ))}
       </View>
-    </View>
+    </ViewShot>
   );
 
   return (
@@ -464,24 +415,37 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
       {...panResponder.panHandlers}
     >
       <StatusBar style="light" backgroundColor="transparent" translucent />
+      
+      {/* Background gradient */}
       <LinearGradient
-        colors={['#6366f1', '#8b5cf6']}
+        colors={['#667eea', '#764ba2', '#f093fb']}
         start={[0, 0]}
-        end={[1, 0]}
-        style={styles.statusBarBackground}
+        end={[1, 1]}
+        style={styles.backgroundGradient}
       />
+      
+      {/* Floating orbs */}
+      <View style={[styles.floatingOrb, styles.orb1]} />
+      <View style={[styles.floatingOrb, styles.orb2]} />
+      <View style={[styles.floatingOrb, styles.orb3]} />
+      
       <SafeAreaView style={styles.safeArea}>
         <KeyboardAvoidingView 
           behavior={Platform.OS === "ios" ? "padding" : "height"}
           style={styles.keyboardAvoid}
         >
           <View style={styles.mainContainer}>
-            <LinearGradient
-              colors={['#6366f1', '#8b5cf6']}
-              start={[0, 0]}
-              end={[1, 0]}
-              style={styles.header}
+            {/* Glass morphism header */}
+            <Animated.View 
+              style={[
+                styles.header,
+                {
+                  opacity: fadeAnim,
+                  transform: [{ translateY: slideAnim }]
+                }
+              ]}
             >
+              <View style={styles.headerGlass} />
               <View style={styles.headerContent}>
                 <TouchableOpacity 
                   style={styles.backButton}
@@ -489,103 +453,174 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
                 >
                   <Ionicons name="chevron-back" size={24} color="white" />
                 </TouchableOpacity>
-                <TextInput
-                  style={styles.splitNameInput}
-                  value={splitName}
-                  onChangeText={handleSplitNameChange}
-                  placeholder="Split Name"
-                  placeholderTextColor="rgba(255, 255, 255, 0.7)"
-                  onBlur={() => {
-                    if (!splitName.trim()) {
-                      setSplitName('Untitled Split');
-                    }
-                    saveSplitData();
-                  }}
-                />
-                <TouchableOpacity 
-                  style={styles.currencyButton}
-                  onPress={() => {
-                    Alert.alert(
-                      "Select Currency",
-                      "Choose the currency for this split",
-                      Object.keys(currencySymbols).map(curr => ({
-                        text: `${curr} (${currencySymbols[curr]})`,
-                        onPress: () => handleCurrencyChange(curr)
-                      }))
-                    );
-                  }}
-                >
-                  <Text style={styles.currencyButtonText}>{currency}</Text>
-                </TouchableOpacity>
-                <TouchableOpacity 
-                  style={styles.shareButton}
-                  onPress={shareSettlementImage}
-                  disabled={people.length < 2}
-                >
-                  <Ionicons name="share-outline" size={20} color="white" />
-                </TouchableOpacity>
+                
+                <View style={styles.headerCenter}>
+                  <TextInput
+                    style={styles.splitNameInput}
+                    value={splitName}
+                    onChangeText={handleSplitNameChange}
+                    placeholder="Split Name"
+                    placeholderTextColor="rgba(255, 255, 255, 0.7)"
+                    onBlur={() => {
+                      if (!splitName.trim()) {
+                        setSplitName('Untitled Split');
+                      }
+                      saveSplitData();
+                    }}
+                  />
+                  <Text style={styles.headerSubtitle}>
+                    {people.length} {people.length === 1 ? 'person' : 'people'} • {formatCurrency(getTotalAmount())}
+                  </Text>
+                </View>
+
+                <View style={styles.headerActions}>
+                  <TouchableOpacity 
+                    style={styles.currencyButton}
+                    onPress={() => {
+                      Alert.alert(
+                        "Select Currency",
+                        "Choose the currency for this split",
+                        Object.keys(currencySymbols).map(curr => ({
+                          text: `${curr} (${currencySymbols[curr]})`,
+                          onPress: () => handleCurrencyChange(curr)
+                        }))
+                      );
+                    }}
+                  >
+                    <Text style={styles.currencyButtonText}>{currency}</Text>
+                  </TouchableOpacity>
+                  
+                  <TouchableOpacity 
+                    style={[styles.shareButton, people.length < 2 && styles.shareButtonDisabled]}
+                    onPress={shareSettlementImage}
+                    disabled={people.length < 2}
+                  >
+                    <Ionicons name="share-outline" size={20} color="white" />
+                  </TouchableOpacity>
+                </View>
               </View>
-              <View style={styles.headerTitleContainer}>
-                <Text style={styles.headerTitle}>Expense Splitter</Text>
-                <Text style={styles.headerSubtitle}>Track expenses and balance payments fairly</Text>
-              </View>
-            </LinearGradient>
+            </Animated.View>
             
             <ScrollView 
               style={styles.content}
               contentContainerStyle={styles.contentContainer}
-              showsVerticalScrollIndicator={true}
+              showsVerticalScrollIndicator={false}
             >
               {isLoading ? (
                 <View style={styles.loadingContainer}>
-                  <Text style={styles.loadingText}>Loading split data...</Text>
+                  <View style={styles.loadingCard}>
+                    <View style={styles.loadingCardGlass} />
+                    <Ionicons name="hourglass-outline" size={32} color="#6366f1" />
+                    <Text style={styles.loadingText}>Loading split data...</Text>
+                  </View>
                 </View>
               ) : (
-                <>
+                <Animated.View
+                  style={{
+                    opacity: fadeAnim,
+                    transform: [{ translateY: slideAnim }]
+                  }}
+                >
                   {/* Add Person Form */}
-                  <View style={styles.formContainer}>
-                    <Text style={styles.sectionTitle}>Add Person</Text>
-                    
-                    {errorMessage ? (
-                      <Text style={styles.errorText}>{errorMessage}</Text>
-                    ) : null}
-                    
-                    <TextInput
-                      ref={nameInputRef}
-                      style={styles.input}
-                      placeholder="Name"
-                      value={newName}
-                      onChangeText={setNewName}
-                      onSubmitEditing={() => amountInputRef.current?.focus()}
-                      returnKeyType="next"
-                    />
-                    
-                    <TextInput
-                      ref={amountInputRef}
-                      style={styles.input}
-                      placeholder="Amount paid"
-                      value={newAmount}
-                      onChangeText={handleAmountChange}
-                      keyboardType="numeric"
-                      onSubmitEditing={addPerson}
-                    />
-                    
-                    <TouchableOpacity style={styles.addPersonButton} onPress={addPerson}>
-                      <Text style={styles.addPersonButtonText}>Add Person</Text>
-                    </TouchableOpacity>
+                  <View style={styles.formCard}>
+                    <View style={styles.formCardGlass} />
+                    <View style={styles.formContainer}>
+                      <View style={styles.formHeader}>
+                        <Ionicons name="person-add-outline" size={24} color="#6366f1" />
+                        <Text style={styles.sectionTitle}>Add Person</Text>
+                      </View>
+                      
+                      {errorMessage ? (
+                        <View style={styles.errorContainer}>
+                          <Ionicons name="alert-circle-outline" size={16} color="#ef4444" />
+                          <Text style={styles.errorText}>{errorMessage}</Text>
+                        </View>
+                      ) : null}
+                      
+                      <View style={styles.inputRow}>
+                        <View style={styles.inputWrapper}>
+                          <Ionicons name="person-outline" size={20} color="#6366f1" style={styles.inputIcon} />
+                          <TextInput
+                            ref={nameInputRef}
+                            style={styles.input}
+                            placeholder="Name"
+                            placeholderTextColor="rgba(107, 114, 128, 0.6)"
+                            value={newName}
+                            onChangeText={setNewName}
+                            onSubmitEditing={() => amountInputRef.current?.focus()}
+                            returnKeyType="next"
+                            onFocus={() => setFormFocused(true)}
+                            onBlur={() => setFormFocused(false)}
+                          />
+                        </View>
+                        
+                        <View style={styles.inputWrapper}>
+                          <Text style={styles.currencyPrefix}>{getCurrencySymbol()}</Text>
+                          <TextInput
+                            ref={amountInputRef}
+                            style={[styles.input, styles.amountInput]}
+                            placeholder="0.00"
+                            placeholderTextColor="rgba(107, 114, 128, 0.6)"
+                            value={newAmount}
+                            onChangeText={handleAmountChange}
+                            keyboardType="numeric"
+                            onSubmitEditing={addPerson}
+                            returnKeyType="done"
+                            onFocus={() => setFormFocused(true)}
+                            onBlur={() => setFormFocused(false)}
+                          />
+                        </View>
+                      </View>
+                      
+                      <TouchableOpacity 
+                        style={[styles.addPersonButton, (!newName.trim() || !newAmount) && styles.addPersonButtonDisabled]} 
+                        onPress={addPerson}
+                        disabled={!newName.trim() || !newAmount}
+                        activeOpacity={0.8}
+                      >
+                        <LinearGradient
+                          colors={(!newName.trim() || !newAmount) ? ['#d1d5db', '#9ca3af'] : ['#6366f1', '#8b5cf6']}
+                          start={[0, 0]}
+                          end={[1, 0]}
+                          style={styles.addPersonButtonGradient}
+                        >
+                          <Ionicons name="add" size={20} color="white" style={{ marginRight: 8 }} />
+                          <Text style={styles.addPersonButtonText}>Add Person</Text>
+                        </LinearGradient>
+                      </TouchableOpacity>
+                    </View>
                   </View>
                   
                   {/* People List */}
                   {people.length > 0 && (
-                    <View style={styles.peopleContainer}>
-                      <Text style={styles.sectionTitle}>People</Text>
-                      <FlatList
-                        data={people}
-                        keyExtractor={(item, index) => index.toString()}
-                        renderItem={({ item, index }) => (
-                          <View style={styles.personItem}>
-                            <Text style={styles.personName}>{item.name}</Text>
-                            <Text style={styles.personAmount}>{formatCurrency(item.amount)}</Text>
+                    <View style={styles.peopleCard}>
+                      <View style={styles.peopleCardGlass} />
+                      <View style={styles.peopleContainer}>
+                        <View style={styles.peopleHeader}>
+                          <Ionicons name="people-outline" size={24} color="#6366f1" />
+                          <Text style={styles.sectionTitle}>People ({people.length})</Text>
+                          <View style={styles.totalBadge}>
+                            <Text style={styles.totalBadgeText}>{formatCurrency(getTotalAmount())}</Text>
+                          </View>
+                        </View>
+                        
+                        {people.map((person, index) => (
+                          <View key={index} style={styles.personItem}>
+                            <View style={styles.personIcon}>
+                              <Ionicons name="person" size={20} color="#6366f1" />
+                            </View>
+                            <View style={styles.personInfo}>
+                              <Text style={styles.personName}>{person.name}</Text>
+                              <Text style={styles.personAmount}>{formatCurrency(person.amount)}</Text>
+                            </View>
+                            <View style={styles.personBalance}>
+                              <Text style={[
+                                styles.personBalanceText,
+                                person.amount > getAverageAmount() ? styles.personBalancePositive : styles.personBalanceNegative
+                              ]}>
+                                {person.amount > getAverageAmount() ? '+' : ''}{formatCurrency(person.amount - getAverageAmount())}
+                              </Text>
+                            </View>
                             <TouchableOpacity 
                               style={styles.removeButton}
                               onPress={() => removePerson(index)}
@@ -593,72 +628,88 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
                               <Ionicons name="close-circle" size={24} color="#ef4444" />
                             </TouchableOpacity>
                           </View>
-                        )}
-                        nestedScrollEnabled={true}
-                        scrollEnabled={false}
-                      />
+                        ))}
+                      </View>
                     </View>
                   )}
                   
-                  {/* Settlements List - now automatically calculated */}
+                  {/* Settlements */}
                   {settlements.length > 0 && (
-                    <View style={styles.settlementsContainer}>
-                      <Text style={styles.sectionTitle}>Settlements</Text>
-                      
-                      {/* Add summary information */}
-                      <View style={styles.summaryCard}>
-                        <View style={styles.summaryRow}>
-                          <Text style={styles.summaryLabel}>Total Expenses:</Text>
-                          <Text style={styles.summaryValue}>
-                            {formatCurrency(people.reduce((sum, person) => sum + person.amount, 0))}
-                          </Text>
+                    <View style={styles.settlementsCard}>
+                      <View style={styles.settlementsCardGlass} />
+                      <View style={styles.settlementsContainer}>
+                        <View style={styles.settlementsHeader}>
+                          <Ionicons name="swap-horizontal-outline" size={24} color="#6366f1" />
+                          <Text style={styles.sectionTitle}>Settlements</Text>
                         </View>
+                        <Text style={styles.settlementInstructions}>
+                          To settle all debts fairly, these payments should be made:
+                        </Text>
                         
-                        <View style={styles.summaryRow}>
-                          <Text style={styles.summaryLabel}>Fair Share Per Person:</Text>
-                          <Text style={styles.summaryValue}>
-                            {formatCurrency(people.reduce((sum, person) => sum + person.amount, 0) / people.length)}
-                          </Text>
-                        </View>
-                      </View>
-                      
-                      <Text style={styles.settlementInstructions}>
-                        To settle all debts, the following payments should be made:
-                      </Text>
-                      
-                      <FlatList
-                        data={settlements}
-                        keyExtractor={(item, index) => index.toString()}
-                        renderItem={({ item }) => (
-                          <View style={styles.transferRow}>
-                            <View style={styles.payerBadge}>
-                              <Text style={styles.payerText}>{item.from}</Text>
+                        {settlements.map((settlement, index) => (
+                          <View key={index} style={styles.settlementItem}>
+                            <View style={styles.settlementFlow}>
+                              <View style={styles.payerBadge}>
+                                <Ionicons name="person" size={16} color="#dc2626" />
+                                <Text style={styles.payerText}>{settlement.from}</Text>
+                              </View>
+                              
+                              <View style={styles.arrowContainer}>
+                                <Ionicons name="arrow-forward" size={20} color="#6366f1" />
+                              </View>
+                              
+                              <View style={styles.receiverBadge}>
+                                <Ionicons name="person" size={16} color="#059669" />
+                                <Text style={styles.receiverText}>{settlement.to}</Text>
+                              </View>
                             </View>
-                            <Text style={styles.arrowText}>→</Text>
-                            <View style={styles.receiverBadge}>
-                              <Text style={styles.receiverText}>{item.to}</Text>
-                            </View>
+                            
                             <View style={styles.transferAmount}>
-                              <Text style={styles.transferAmountText}>{formatCurrency(item.amount)}</Text>
+                              <Text style={styles.transferAmountText}>{formatCurrency(settlement.amount)}</Text>
                             </View>
                           </View>
-                        )}
-                        nestedScrollEnabled={true}
-                        scrollEnabled={false}
-                      />
+                        ))}
+                      </View>
                     </View>
                   )}
-                </>
+                  
+                  {/* Summary Stats */}
+                  {people.length > 0 && (
+                    <View style={styles.summaryCard}>
+                      <View style={styles.summaryCardGlass} />
+                      <View style={styles.summaryContainer}>
+                        <Text style={styles.summaryTitle}>Split Summary</Text>
+                        
+                        <View style={styles.summaryStats}>
+                          <View style={styles.summaryStatItem}>
+                            <Text style={styles.summaryStatValue}>{people.length}</Text>
+                            <Text style={styles.summaryStatLabel}>People</Text>
+                          </View>
+                          <View style={styles.summaryStatDivider} />
+                          <View style={styles.summaryStatItem}>
+                            <Text style={styles.summaryStatValue}>{formatCurrency(getTotalAmount())}</Text>
+                            <Text style={styles.summaryStatLabel}>Total</Text>
+                          </View>
+                          <View style={styles.summaryStatDivider} />
+                          <View style={styles.summaryStatItem}>
+                            <Text style={styles.summaryStatValue}>{formatCurrency(getAverageAmount())}</Text>
+                            <Text style={styles.summaryStatLabel}>Per Person</Text>
+                          </View>
+                        </View>
+                      </View>
+                    </View>
+                  )}
+                  
+                  {/* Hidden ViewShot for sharing */}
+                  <View style={{ position: 'absolute', left: -9999 }}>
+                    <SplitSummaryCard />
+                  </View>
+                </Animated.View>
               )}
             </ScrollView>
           </View>
         </KeyboardAvoidingView>
       </SafeAreaView>
-      <View style={{ position: 'absolute', opacity: 0, width: width * 0.8 }}>
-        <ViewShot ref={viewShotRef} options={{ format: 'png', quality: 0.9 }}>
-          <SplitSummaryCard />
-        </ViewShot>
-      </View>
     </Animated.View>
   );
 }
@@ -667,7 +718,39 @@ export default function ExpenseSplitter({ route, navigation }: ExpenseSplitterPr
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f3f4f6',
+  },
+  backgroundGradient: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+  },
+  floatingOrb: {
+    position: 'absolute',
+    borderRadius: 100,
+    opacity: 0.1,
+  },
+  orb1: {
+    width: 200,
+    height: 200,
+    backgroundColor: '#ffffff',
+    top: -50,
+    right: -50,
+  },
+  orb2: {
+    width: 150,
+    height: 150,
+    backgroundColor: '#6366f1',
+    bottom: 100,
+    left: -75,
+  },
+  orb3: {
+    width: 100,
+    height: 100,
+    backgroundColor: '#8b5cf6',
+    top: height * 0.4,
+    right: -20,
   },
   statusBarBackground: {
     height: Constants.statusBarHeight,
@@ -1025,5 +1108,248 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#111827',
     fontWeight: 'bold',
+  },
+  headerGlass: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 24,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  headerCenter: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  headerSubtitle: {
+    fontSize: 16,
+    color: 'rgba(255, 255, 255, 0.8)',
+    textAlign: 'center',
+  },
+  loadingCard: {
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 24,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  loadingCardGlass: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  formCard: {
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 24,
+    marginBottom: 24,
+  },
+  formCardGlass: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  formHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  inputWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'white',
+    borderRadius: 8,
+    padding: 12,
+    marginRight: 8,
+  },
+  inputIcon: {
+    marginRight: 8,
+  },
+  currencyPrefix: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#111827',
+  },
+  amountInput: {
+    width: 100,
+  },
+  addPersonButtonGradient: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  peopleCard: {
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 24,
+    marginBottom: 24,
+  },
+  peopleCardGlass: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  peopleContainer: {
+    marginBottom: 24,
+  },
+  peopleHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  totalBadge: {
+    backgroundColor: '#fee2e2',
+    borderRadius: 16,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    marginLeft: 'auto',
+  },
+  totalBadgeText: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#b91c1c',
+  },
+  personIcon: {
+    marginRight: 12,
+  },
+  personInfo: {
+    flex: 1,
+  },
+  personName: {
+    fontSize: 16,
+    fontWeight: '500',
+  },
+  personAmount: {
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  personBalance: {
+    marginLeft: 'auto',
+  },
+  personBalanceText: {
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  personBalancePositive: {
+    color: '#059669',
+  },
+  personBalanceNegative: {
+    color: '#dc2626',
+  },
+  settlementsCard: {
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 24,
+    marginBottom: 24,
+  },
+  settlementsCardGlass: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  settlementsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  settlementInstructions: {
+    fontSize: 15,
+    color: '#4b5563',
+    marginBottom: 12,
+    fontStyle: 'italic',
+  },
+  summaryCard: {
+    backgroundColor: 'white',
+    borderRadius: 12,
+    padding: 24,
+    marginBottom: 24,
+  },
+  summaryCardGlass: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  summaryContainer: {
+    marginBottom: 16,
+  },
+  summaryTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#111827',
+    marginBottom: 12,
+  },
+  summaryStats: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  summaryStatItem: {
+    flex: 1,
+  },
+  summaryStatValue: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#111827',
+  },
+  summaryStatLabel: {
+    fontSize: 14,
+    color: '#4b5563',
+    fontWeight: '500',
+  },
+  summaryStatDivider: {
+    height: 1,
+    backgroundColor: '#e5e7eb',
+    marginVertical: 8,
+  },
+  shareButtonDisabled: {
+    opacity: 0.5,
+  },
+  errorContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  addPersonButtonDisabled: {
+    opacity: 0.6,
+  },
+  settlementFlow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  arrowContainer: {
+    marginHorizontal: 12,
   },
 }); 
